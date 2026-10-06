@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QR Scanner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Tahoma,Arial,sans-serif;overflow:hidden}
+video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover}
+.frame{position:fixed;top:50%;left:50%;width:66vmin;height:66vmin;transform:translate(-50%,-50%);border:3px solid #34d399;border-radius:18px;box-shadow:0 0 0 100vmax rgba(0,0,0,.55)}
+#msg{position:fixed;left:0;right:0;top:calc(50% + 36vmin + 16px);text-align:center;font-size:16px;padding:0 16px}
+.bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:10px;padding:14px 14px calc(14px + env(safe-area-inset-bottom,0px));background:rgba(0,0,0,.6)}
+.bar button{flex:1;height:50px;border:0;border-radius:14px;font:inherit;font-size:16px;font-weight:700;background:#fff;color:#1e293b}
+.bar #cancel{background:#dc2626;color:#fff}
+#res{position:fixed;inset:0;background:#0f172a;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center}
+#res pre{direction:ltr;white-space:pre-wrap;word-break:break-all;background:#1e293b;padding:12px;border-radius:12px;max-width:100%}
+#res button{height:50px;padding:0 24px;border:0;border-radius:14px;font:inherit;font-size:16px;font-weight:700;background:#2563eb;color:#fff}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted autoplay></video>
+<div class="frame"></div>
+<div id="msg">وجّه الكاميرا على الـ QR</div>
+<div class="bar">
+  <button id="torch" style="display:none">🔦 فلاش</button>
+  <button id="pickBtn">🖼️ صورة</button>
+  <button id="cancel">إلغاء</button>
+</div>
+<input type="file" id="pick" accept="image/*" hidden>
+<div id="res"><div id="resMsg"></div><pre id="resTxt"></pre><button id="copy">نسخ النتيجة</button></div>
+<script>
+const $ = s => document.querySelector(s);
+const RET = new URLSearchParams(location.search).get('ret') || '';
+// the return link is accepted only if it is an Apps Script web app link
+const RET_OK = /^https:\/\/script\.google\.com\/(?:a\/)?macros\/(?:[^\/]+\/)?s\/[^\/]+\/exec$/.test(RET);
+
+let stream = null, on = true;
+
+function finish(text) {
+  if (!on) return;
+  on = false;
+  if (navigator.vibrate) navigator.vibrate(80);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (RET_OK) {
+    location.replace(RET + '?scan=' + encodeURIComponent(text) + '&t=' + Date.now());
+  } else {
+    $('#resMsg').textContent = RET ? 'رابط الرجوع غير صالح، انسخ النتيجة يدويًا' : 'تم القراءة (مفيش رابط رجوع)';
+    $('#resTxt').textContent = text;
+    $('#res').style.display = 'flex';
+  }
+}
+
+function cancel() {
+  on = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (RET_OK) location.replace(RET); else history.back();
+}
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }, audio: false
+    });
+  } catch (e) {
+    $('#msg').textContent = 'مفيش صلاحية للكاميرا. اسمح بالكاميرا للموقع أو اختار صورة';
+    return;
+  }
+  const v = $('#v');
+  v.srcObject = stream;
+  v.play().catch(() => {});
+
+  const track = stream.getVideoTracks()[0];
+  try {
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.torch) {
+      $('#torch').style.display = 'block';
+      let t = false;
+      $('#torch').onclick = async () => {
+        t = !t;
+        try { await track.applyConstraints({ advanced: [{ torch: t }] }); } catch (e) {}
+      };
+    }
+  } catch (e) {}
+
+  const bd = window.BarcodeDetector ? new BarcodeDetector({ formats: ['qr_code'] }) : null;
+  const cv = document.createElement('canvas');
+  const cx = cv.getContext('2d', { willReadFrequently: true });
+
+  (async function tick() {
+    if (!on) return;
+    try {
+      if (v.videoWidth) {
+        let text = '';
+        if (bd) {
+          const r = await bd.detect(v);
+          if (r[0]) text = r[0].rawValue;
+        } else if (window.jsQR) {
+          const k = Math.min(1, 720 / v.videoWidth);
+          cv.width = v.videoWidth * k;
+          cv.height = v.videoHeight * k;
+          cx.drawImage(v, 0, 0, cv.width, cv.height);
+          const d = cx.getImageData(0, 0, cv.width, cv.height);
+          const q = jsQR(d.data, cv.width, cv.height, { inversionAttempts: 'dontInvert' });
+          if (q) text = q.data;
+        }
+        if (text) return finish(text);
+      }
+    } catch (e) {}
+    setTimeout(tick, 120);
+  })();
+}
+
+// reading from a photo
+$('#pickBtn').onclick = () => $('#pick').click();
+$('#pick').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  $('#msg').textContent = 'جاري قراءة الصورة...';
+  try {
+    const bmp = await createImageBitmap(f, { imageOrientation: 'from-image' });
+    let text = '';
+    if (window.BarcodeDetector) {
+      try { const r = await new BarcodeDetector({ formats: ['qr_code'] }).detect(bmp); if (r[0]) text = r[0].rawValue; } catch (e) {}
+    }
+    for (const w of [1000, 1600, 600]) {
+      if (text) break;
+      const k = Math.min(1, w / bmp.width);
+      const c = document.createElement('canvas');
+      c.width = Math.round(bmp.width * k);
+      c.height = Math.round(bmp.height * k);
+      const x = c.getContext('2d');
+      x.drawImage(bmp, 0, 0, c.width, c.height);
+      const d = x.getImageData(0, 0, c.width, c.height);
+      const q = window.jsQR && jsQR(d.data, c.width, c.height, { inversionAttempts: 'dontInvert' });
+      if (q && q.data) text = q.data;
+    }
+    if (text) finish(text);
+    else $('#msg').textContent = 'مقدرتش أقرا الـ QR من الصورة، جرّب صورة أوضح';
+  } catch (err) {
+    $('#msg').textContent = 'حصل خطأ في قراءة الصورة';
+  }
+};
+
+$('#cancel').onclick = cancel;
+$('#copy').onclick = () => {
+  const t = $('#resTxt').textContent;
+  if (navigator.clipboard) navigator.clipboard.writeText(t).catch(() => {});
+  $('#copy').textContent = 'تم النسخ';
+};
+
+start();
+</script>
+</body>
+</html>
